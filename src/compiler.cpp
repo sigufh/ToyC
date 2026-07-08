@@ -118,6 +118,8 @@ struct Func {
     unique_ptr<Stmt> body;
     map<string, int> paramOffsets;
     map<string, string> paramRegs;
+    vector<int> paramOffsetList;
+    vector<string> paramRegList;
     vector<string> savedRegs;
     bool hasCall = false;
     bool savesRa = false;
@@ -478,6 +480,8 @@ public:
         prepareGlobalConsts();
         for (auto& fn : prog.funcs) {
             optimizeFunction(*fn);
+            removeNeverReadLocals(*fn->body);
+            removeNeverReadLocals(*fn->body);
         }
     }
 
@@ -970,6 +974,124 @@ private:
         if (e.rhs) collectVars(*e.rhs, vars);
         for (const auto& arg : e.args) collectVars(*arg, vars);
     }
+
+    void removeNeverReadLocals(Stmt& body) {
+        map<string, int> localDecls;
+        map<string, int> reads;
+        collectLocalDeclsAndReads(body, localDecls, reads);
+        removeNeverReadLocalsInStmt(body, localDecls, reads);
+        cleanupEmptyStmts(body);
+    }
+
+    void collectLocalDeclsAndReads(const Stmt& s, map<string, int>& localDecls,
+                                   map<string, int>& reads) const {
+        if (s.expr) collectReads(*s.expr, reads);
+        if (s.rhs) collectReads(*s.rhs, reads, s.kind == Stmt::Assign ? &s.name : nullptr);
+        if (s.decl) {
+            ++localDecls[s.decl->name];
+            if (s.decl->init) collectReads(*s.decl->init, reads);
+        }
+        if (s.thenStmt) collectLocalDeclsAndReads(*s.thenStmt, localDecls, reads);
+        if (s.elseStmt) collectLocalDeclsAndReads(*s.elseStmt, localDecls, reads);
+        for (const auto& child : s.stmts) collectLocalDeclsAndReads(*child, localDecls, reads);
+    }
+
+    static void collectReads(const Expr& e, map<string, int>& reads,
+                             const string* ignoredSelfRead = nullptr) {
+        if (e.kind == Expr::Var && (!ignoredSelfRead || e.name != *ignoredSelfRead)) {
+            ++reads[e.name];
+        }
+        if (e.lhs) collectReads(*e.lhs, reads, ignoredSelfRead);
+        if (e.rhs) collectReads(*e.rhs, reads, ignoredSelfRead);
+        for (const auto& arg : e.args) collectReads(*arg, reads);
+    }
+
+    void removeNeverReadLocalsInStmt(Stmt& s, const map<string, int>& localDecls,
+                                     const map<string, int>& reads) {
+        switch (s.kind) {
+            case Stmt::Block:
+                for (auto& child : s.stmts) removeNeverReadLocalsInStmt(*child, localDecls, reads);
+                cleanupEmptyStmts(s);
+                break;
+            case Stmt::DeclStmt:
+                if (isNeverReadUniqueLocal(s.decl->name, localDecls, reads)) {
+                    if (s.decl->init && exprHasCall(*s.decl->init)) {
+                        s.kind = Stmt::ExprStmt;
+                        s.expr = std::move(s.decl->init);
+                    } else {
+                        s.kind = Stmt::Empty;
+                    }
+                    s.decl.reset();
+                }
+                break;
+            case Stmt::Assign:
+                if (isNeverReadUniqueLocal(s.name, localDecls, reads)) {
+                    if (s.rhs && exprHasCall(*s.rhs)) {
+                        s.kind = Stmt::ExprStmt;
+                        s.expr = std::move(s.rhs);
+                    } else {
+                        s.kind = Stmt::Empty;
+                    }
+                    s.rhs.reset();
+                }
+                break;
+            case Stmt::If:
+                removeNeverReadLocalsInStmt(*s.thenStmt, localDecls, reads);
+                cleanupEmptyStmts(*s.thenStmt);
+                if (s.elseStmt) {
+                    removeNeverReadLocalsInStmt(*s.elseStmt, localDecls, reads);
+                    cleanupEmptyStmts(*s.elseStmt);
+                }
+                if (s.expr && !exprHasCall(*s.expr) && stmtIsEmpty(*s.thenStmt) &&
+                    (!s.elseStmt || stmtIsEmpty(*s.elseStmt))) {
+                    s.kind = Stmt::Empty;
+                    s.expr.reset();
+                    s.thenStmt.reset();
+                    s.elseStmt.reset();
+                }
+                break;
+            case Stmt::While:
+                removeNeverReadLocalsInStmt(*s.thenStmt, localDecls, reads);
+                cleanupEmptyStmts(*s.thenStmt);
+                if (s.expr && !exprHasCall(*s.expr) && stmtIsEmpty(*s.thenStmt)) {
+                    s.kind = Stmt::Empty;
+                    s.expr.reset();
+                    s.thenStmt.reset();
+                }
+                break;
+            default:
+                break;
+        }
+    }
+
+    bool isNeverReadUniqueLocal(const string& name, const map<string, int>& localDecls,
+                                const map<string, int>& reads) const {
+        auto decl = localDecls.find(name);
+        if (decl == localDecls.end() || decl->second != 1) return false;
+        if (globalNames.count(name)) return false;
+        auto read = reads.find(name);
+        return read == reads.end() || read->second == 0;
+    }
+
+    static bool stmtIsEmpty(const Stmt& s) {
+        if (s.kind == Stmt::Empty) return true;
+        if (s.kind != Stmt::Block) return false;
+        for (const auto& child : s.stmts) {
+            if (!stmtIsEmpty(*child)) return false;
+        }
+        return true;
+    }
+
+    static void cleanupEmptyStmts(Stmt& s) {
+        if (s.kind != Stmt::Block) return;
+        vector<unique_ptr<Stmt>> kept;
+        kept.reserve(s.stmts.size());
+        for (auto& child : s.stmts) {
+            if (stmtIsEmpty(*child)) continue;
+            kept.push_back(std::move(child));
+        }
+        s.stmts = std::move(kept);
+    }
 };
 
 class CodeGen {
@@ -1081,6 +1203,8 @@ private:
             savedRegCount = 0;
             fn->paramOffsets.clear();
             fn->paramRegs.clear();
+            fn->paramOffsetList.clear();
+            fn->paramRegList.clear();
             fn->savedRegs.clear();
             fn->hasCall = optimize ? stmtContainsRuntimeCall(*fn->body, *fn)
                                    : stmtContainsCall(*fn->body);
@@ -1089,8 +1213,13 @@ private:
                 string reg = allocSavedReg();
                 if (!reg.empty()) {
                     fn->paramRegs[p] = reg;
+                    fn->paramRegList.push_back(reg);
+                    fn->paramOffsetList.push_back(0);
                 } else {
-                    fn->paramOffsets[p] = allocSlot();
+                    int offset = allocSlot();
+                    fn->paramOffsets[p] = offset;
+                    fn->paramRegList.push_back("");
+                    fn->paramOffsetList.push_back(offset);
                 }
             }
             assignOffsets(*fn->body);
@@ -1404,7 +1533,7 @@ private:
                     emitExprInto(*e.args[i], "a" + to_string(i), 0);
                 }
                 for (int i = 0; i < n; ++i) {
-                    Symbol sym = lookup(currentFunc->params[i]);
+                    Symbol sym = paramSymbol(*currentFunc, i);
                     if (!sym.reg.empty()) {
                         out << "    mv " << sym.reg << ", a" << i << "\n";
                     } else {
@@ -1423,7 +1552,7 @@ private:
         }
         for (int i = 0; i < n; ++i) {
             emitLoadReg("t0", (n - 1 - i) * 4, "sp");
-            Symbol sym = lookup(currentFunc->params[i]);
+            Symbol sym = paramSymbol(*currentFunc, i);
             if (!sym.reg.empty()) {
                 out << "    mv " << sym.reg << ", t0\n";
             } else {
@@ -1436,6 +1565,15 @@ private:
         }
         out << "    j " << currentTailLabel << "\n";
         return true;
+    }
+
+    Symbol paramSymbol(const Func& fn, int index) const {
+        Symbol sym;
+        if (index >= 0 && static_cast<size_t>(index) < fn.paramRegList.size()) {
+            sym.reg = fn.paramRegList[index];
+            sym.offset = fn.paramOffsetList[index];
+        }
+        return sym;
     }
 
     void emitDecl(Decl& d) {
@@ -1519,7 +1657,7 @@ private:
                 string end = newLabel("while_end");
                 loopLabels.push_back({begin, end});
                 out << begin << ":\n";
-                for (int i = 0; i < 4; ++i) {
+                for (int i = 0; i < 8; ++i) {
                     emitBranchIfFalse(*s.expr, end);
                     emitStmt(*s.thenStmt);
                     if (stmtTerminates(*s.thenStmt)) break;
@@ -1922,7 +2060,11 @@ private:
         if (!inlineSubsts.empty()) {
             auto found = inlineSubsts.back().find(name);
             if (found != inlineSubsts.back().end()) {
-                emitExprInto(*found->second, dest, 0);
+                Expr* replacement = found->second;
+                auto subst = std::move(inlineSubsts.back());
+                inlineSubsts.pop_back();
+                emitExprInto(*replacement, dest, 0);
+                inlineSubsts.push_back(std::move(subst));
                 return;
             }
         }
@@ -2231,7 +2373,11 @@ private:
         if (!inlineSubsts.empty()) {
             auto found = inlineSubsts.back().find(name);
             if (found != inlineSubsts.back().end()) {
-                emitExpr(*found->second);
+                Expr* replacement = found->second;
+                auto subst = std::move(inlineSubsts.back());
+                inlineSubsts.pop_back();
+                emitExpr(*replacement);
+                inlineSubsts.push_back(std::move(subst));
                 return;
             }
         }
@@ -2436,7 +2582,14 @@ private:
             case Expr::Var: {
                 if (!inlineSubsts.empty()) {
                     auto found = inlineSubsts.back().find(e.name);
-                    if (found != inlineSubsts.back().end()) return evalConst(*found->second);
+                    if (found != inlineSubsts.back().end()) {
+                        Expr* replacement = found->second;
+                        auto subst = std::move(inlineSubsts.back());
+                        inlineSubsts.pop_back();
+                        auto value = evalConst(*replacement);
+                        inlineSubsts.push_back(std::move(subst));
+                        return value;
+                    }
                 }
                 Symbol sym = lookupConstScope(e.name);
                 if (sym.isConst) return sym.constValue;
