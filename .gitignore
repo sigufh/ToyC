@@ -1,0 +1,5 @@
+compiler
+build/
+cmake-build-*/
+*.o
+*.s
