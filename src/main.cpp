@@ -1,27 +1,35 @@
-#include "compiler.hpp"
-
-#include <exception>
 #include <iostream>
 #include <iterator>
 #include <string>
 
-using namespace std;
+#include "backend/riscv.hpp"
+#include "frontend/parser_driver.hpp"
+#include "ir/ir_builder.hpp"
+#include "ir/optim.hpp"
+#include "sema/semantic.hpp"
 
-int main(int argc, char** argv) {
-    ios::sync_with_stdio(false);
-    cin.tie(nullptr);
+namespace {
 
-    bool optimize = false;
-    for (int i = 1; i < argc; ++i) {
-        if (string(argv[i]) == "-opt") optimize = true;
-    }
+std::string readStdin() {
+  return std::string(std::istreambuf_iterator<char>(std::cin),
+                     std::istreambuf_iterator<char>());
+}
 
-    string input((istreambuf_iterator<char>(cin)), istreambuf_iterator<char>());
-    try {
-        cout << compileToyC(input, optimize);
-    } catch (const exception& ex) {
-        cerr << ex.what() << '\n';
-        return 1;
-    }
-    return 0;
+}  // namespace
+
+int main(int argc, char *argv[]) {
+  const bool optimize = argc > 1 && std::string(argv[1]) == "-opt";
+  (void)optimize;
+
+  const std::string source = readStdin();
+  auto ast = toycc::frontend::parseSource(source);
+  toycc::sema::analyze(*ast);
+  auto ir = toycc::ir::buildIr(*ast);
+
+  // 本年度鼓励后端优化；这里的 IR 级优化在正确性路上之后总是启用。即使
+  // 性能测试不传 `-opt`，也不影响功能正确性。
+  toycc::ir::optimizeProgram(ir);
+
+  toycc::backend::emitRiscv(ir, std::cout);
+  return 0;
 }
