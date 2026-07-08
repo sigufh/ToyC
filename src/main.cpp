@@ -5,6 +5,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -95,6 +96,7 @@ struct Decl {
     string name;
     unique_ptr<Expr> init;
     int offset = 0;
+    string reg;
 };
 
 struct Stmt {
@@ -114,6 +116,8 @@ struct Func {
     vector<string> params;
     unique_ptr<Stmt> body;
     map<string, int> paramOffsets;
+    map<string, string> paramRegs;
+    vector<string> savedRegs;
     int frameSize = 16;
 };
 
@@ -416,6 +420,7 @@ struct Symbol {
     int32_t constValue = 0;
     int offset = 0;
     string label;
+    string reg;
 };
 
 static int alignTo(int value, int align) {
@@ -429,6 +434,7 @@ public:
     string emit() {
         prepareGlobals();
         prepareFunctions();
+        for (auto& fn : prog.funcs) funcMap[fn->name] = fn.get();
 
         out << "    .option nopic\n";
         emitData();
@@ -442,11 +448,17 @@ private:
     bool optimize = false;
     ostringstream out;
     map<string, Symbol> globals;
+    map<string, Func*> funcMap;
+    set<string> assignedNames;
     vector<map<string, Symbol>> scopes;
+    vector<map<string, Expr*>> inlineSubsts;
     vector<pair<string, string>> loopLabels;
     string currentEndLabel;
+    string currentTailLabel;
+    Func* currentFunc = nullptr;
     int labelId = 0;
     int slotCount = 0;
+    int savedRegCount = 0;
 
     string newLabel(const string& base) {
         return ".L" + base + "_" + to_string(labelId++);
@@ -458,25 +470,46 @@ private:
 
     void prepareGlobals() {
         scopes.clear();
+        assignedNames.clear();
+        for (auto& fn : prog.funcs) collectAssignedNames(*fn->body);
         for (auto& d : prog.globals) {
             Symbol sym;
-            sym.isConst = d->isConst;
+            auto initValue = evalConst(*d->init);
+            sym.isConst = d->isConst || (optimize && initValue && !assignedNames.count(d->name));
             sym.isGlobal = true;
             sym.label = d->name;
-            if (auto v = evalConst(*d->init)) sym.constValue = *v;
+            if (initValue) sym.constValue = *initValue;
             globals[d->name] = sym;
         }
+    }
+
+    void collectAssignedNames(Stmt& s) {
+        if (s.kind == Stmt::Assign) assignedNames.insert(s.name);
+        if (s.thenStmt) collectAssignedNames(*s.thenStmt);
+        if (s.elseStmt) collectAssignedNames(*s.elseStmt);
+        for (auto& child : s.stmts) collectAssignedNames(*child);
     }
 
     void prepareFunctions() {
         for (auto& fn : prog.funcs) {
             slotCount = 0;
+            savedRegCount = 0;
+            fn->paramOffsets.clear();
+            fn->paramRegs.clear();
+            fn->savedRegs.clear();
             for (const string& p : fn->params) {
-                int off = allocSlot();
-                fn->paramOffsets[p] = off;
+                string reg = allocSavedReg();
+                if (!reg.empty()) {
+                    fn->paramRegs[p] = reg;
+                } else {
+                    fn->paramOffsets[p] = allocSlot();
+                }
             }
             assignOffsets(*fn->body);
-            fn->frameSize = alignTo(slotCount * 4 + 8, 16);
+            for (int i = 1; i <= savedRegCount; ++i) {
+                fn->savedRegs.push_back("s" + to_string(i));
+            }
+            fn->frameSize = alignTo(slotCount * 4 + 8 + static_cast<int>(fn->savedRegs.size()) * 4, 16);
         }
     }
 
@@ -486,13 +519,27 @@ private:
         return offset;
     }
 
+    string allocSavedReg() {
+        if (!optimize || savedRegCount >= 11) return "";
+        ++savedRegCount;
+        return "s" + to_string(savedRegCount);
+    }
+
     void assignOffsets(Stmt& s) {
         switch (s.kind) {
             case Stmt::Block:
                 for (auto& child : s.stmts) assignOffsets(*child);
                 break;
             case Stmt::DeclStmt:
-                if (!s.decl->isConst) s.decl->offset = allocSlot();
+                if (!s.decl->isConst) {
+                    if (optimize) {
+                        if (auto val = evalConst(*s.decl->init); val && !assignedNames.count(s.decl->name)) {
+                            break;
+                        }
+                    }
+                    s.decl->reg = allocSavedReg();
+                    if (s.decl->reg.empty()) s.decl->offset = allocSlot();
+                }
                 break;
             case Stmt::If:
                 assignOffsets(*s.thenStmt);
@@ -523,41 +570,76 @@ private:
     }
 
     void emitFunction(Func& fn) {
+        currentFunc = &fn;
         scopes.clear();
         scopes.emplace_back();
         for (const string& p : fn.params) {
-            scopes.back()[p] = Symbol{false, false, 0, fn.paramOffsets[p], ""};
+            Symbol sym;
+            sym.offset = fn.paramOffsets[p];
+            sym.reg = fn.paramRegs[p];
+            scopes.back()[p] = sym;
         }
 
         currentEndLabel = newLabel(fn.name + "_end");
+        currentTailLabel = newLabel(fn.name + "_tail");
         out << "    .globl " << fn.name << "\n";
         out << fn.name << ":\n";
         out << "    addi sp, sp, -" << fn.frameSize << "\n";
+        for (size_t i = 0; i < fn.savedRegs.size(); ++i) {
+            out << "    sw " << fn.savedRegs[i] << ", " << i * 4 << "(sp)\n";
+        }
         out << "    sw ra, " << fn.frameSize - 4 << "(sp)\n";
         out << "    sw s0, " << fn.frameSize - 8 << "(sp)\n";
         out << "    addi s0, sp, " << fn.frameSize << "\n";
         for (size_t i = 0; i < fn.params.size(); ++i) {
-            int off = fn.paramOffsets[fn.params[i]];
+            string dstReg = fn.paramRegs[fn.params[i]];
             if (i < 8) {
-                out << "    sw a" << i << ", " << mem(off) << "\n";
+                if (!dstReg.empty()) out << "    mv " << dstReg << ", a" << i << "\n";
+                else out << "    sw a" << i << ", " << mem(fn.paramOffsets[fn.params[i]]) << "\n";
             } else {
                 out << "    lw t0, " << (static_cast<int>(i) - 8) * 4 << "(s0)\n";
-                out << "    sw t0, " << mem(off) << "\n";
+                if (!dstReg.empty()) out << "    mv " << dstReg << ", t0\n";
+                else out << "    sw t0, " << mem(fn.paramOffsets[fn.params[i]]) << "\n";
             }
         }
+        out << currentTailLabel << ":\n";
         emitBlock(*fn.body);
         if (fn.returnsVoid) out << "    li a0, 0\n";
         out << currentEndLabel << ":\n";
         out << "    lw ra, " << fn.frameSize - 4 << "(sp)\n";
         out << "    lw s0, " << fn.frameSize - 8 << "(sp)\n";
+        for (size_t i = 0; i < fn.savedRegs.size(); ++i) {
+            out << "    lw " << fn.savedRegs[i] << ", " << i * 4 << "(sp)\n";
+        }
         out << "    addi sp, sp, " << fn.frameSize << "\n";
         out << "    ret\n";
+        currentFunc = nullptr;
     }
 
     void emitBlock(Stmt& s) {
         scopes.emplace_back();
-        for (auto& child : s.stmts) emitStmt(*child);
+        for (auto& child : s.stmts) {
+            emitStmt(*child);
+            if (optimize && stmtTerminates(*child)) break;
+        }
         scopes.pop_back();
+    }
+
+    bool stmtTerminates(Stmt& s) const {
+        if (s.kind == Stmt::Return || s.kind == Stmt::Break || s.kind == Stmt::Continue) return true;
+        if (s.kind == Stmt::Block) {
+            for (auto it = s.stmts.rbegin(); it != s.stmts.rend(); ++it) {
+                if ((*it)->kind == Stmt::Empty || (*it)->kind == Stmt::DeclStmt || (*it)->kind == Stmt::ExprStmt) {
+                    continue;
+                }
+                return stmtTerminates(**it);
+            }
+            return false;
+        }
+        if (s.kind == Stmt::If && s.elseStmt) {
+            return stmtTerminates(*s.thenStmt) && stmtTerminates(*s.elseStmt);
+        }
+        return false;
     }
 
     void emitStmt(Stmt& s) {
@@ -571,11 +653,17 @@ private:
                 emitExpr(*s.expr);
                 break;
             case Stmt::Assign: {
-                emitExpr(*s.rhs);
                 Symbol sym = lookup(s.name);
+                if (optimize && !sym.reg.empty() && !hasCall(*s.rhs)) {
+                    emitExprInto(*s.rhs, sym.reg, 0);
+                    break;
+                }
+                emitExpr(*s.rhs);
                 if (sym.isGlobal) {
                     out << "    la t0, " << sym.label << "\n";
                     out << "    sw a0, 0(t0)\n";
+                } else if (!sym.reg.empty()) {
+                    out << "    mv " << sym.reg << ", a0\n";
                 } else {
                     out << "    sw a0, " << mem(sym.offset) << "\n";
                 }
@@ -597,6 +685,9 @@ private:
                 out << "    j " << loopLabels.back().first << "\n";
                 break;
             case Stmt::Return:
+                if (optimize && s.expr && emitTailRecursiveReturn(*s.expr)) {
+                    break;
+                }
                 if (s.expr) emitExpr(*s.expr);
                 else out << "    li a0, 0\n";
                 out << "    j " << currentEndLabel << "\n";
@@ -604,15 +695,62 @@ private:
         }
     }
 
+    bool emitTailRecursiveReturn(Expr& e) {
+        if (!currentFunc || e.kind != Expr::Call || e.name != currentFunc->name) return false;
+        if (e.args.size() != currentFunc->params.size()) return false;
+        int n = static_cast<int>(e.args.size());
+        for (auto& arg : e.args) {
+            emitExpr(*arg);
+            out << "    addi sp, sp, -4\n";
+            out << "    sw a0, 0(sp)\n";
+        }
+        for (int i = 0; i < n; ++i) {
+            out << "    lw t0, " << (n - 1 - i) * 4 << "(sp)\n";
+            Symbol sym = lookup(currentFunc->params[i]);
+            if (!sym.reg.empty()) {
+                out << "    mv " << sym.reg << ", t0\n";
+            } else {
+                out << "    sw t0, " << mem(sym.offset) << "\n";
+            }
+        }
+        if (n > 0) out << "    addi sp, sp, " << n * 4 << "\n";
+        out << "    j " << currentTailLabel << "\n";
+        return true;
+    }
+
     void emitDecl(Decl& d) {
         if (d.isConst) {
             int32_t val = evalConst(*d.init).value_or(0);
-            scopes.back()[d.name] = Symbol{true, false, val, 0, ""};
+            Symbol sym;
+            sym.isConst = true;
+            sym.constValue = val;
+            scopes.back()[d.name] = sym;
             return;
         }
-        emitExpr(*d.init);
-        out << "    sw a0, " << mem(d.offset) << "\n";
-        scopes.back()[d.name] = Symbol{false, false, 0, d.offset, ""};
+        if (optimize) {
+            if (auto val = evalConst(*d.init); val && !assignedNames.count(d.name)) {
+                Symbol sym;
+                sym.isConst = true;
+                sym.constValue = *val;
+                scopes.back()[d.name] = sym;
+                return;
+            }
+        }
+        if (!d.reg.empty()) {
+            if (optimize && !hasCall(*d.init)) {
+                emitExprInto(*d.init, d.reg, 0);
+            } else {
+                emitExpr(*d.init);
+                out << "    mv " << d.reg << ", a0\n";
+            }
+        } else {
+            emitExpr(*d.init);
+            out << "    sw a0, " << mem(d.offset) << "\n";
+        }
+        Symbol sym;
+        sym.offset = d.offset;
+        sym.reg = d.reg;
+        scopes.back()[d.name] = sym;
     }
 
     void emitIf(Stmt& s) {
@@ -661,6 +799,10 @@ private:
                 out << "    li a0, " << *v << "\n";
                 return;
             }
+            if (!hasCall(e)) {
+                emitExprInto(e, "a0", 0);
+                return;
+            }
         }
         switch (e.kind) {
             case Expr::Number:
@@ -670,6 +812,7 @@ private:
                 emitLoadVar(e.name);
                 break;
             case Expr::Call:
+                if (optimize && emitInlineCall(e, "a0")) break;
                 emitCall(e);
                 break;
             case Expr::Unary:
@@ -681,13 +824,285 @@ private:
         }
     }
 
+    bool hasCall(Expr& e) const {
+        if (e.kind == Expr::Call) return true;
+        if (e.lhs && hasCall(*e.lhs)) return true;
+        if (e.rhs && hasCall(*e.rhs)) return true;
+        for (const auto& arg : e.args) {
+            if (hasCall(*arg)) return true;
+        }
+        return false;
+    }
+
+    string tempReg(int depth, const string& avoid) const {
+        static const vector<string> regs = {"t0", "t1", "t2", "t3", "t4", "t5", "t6"};
+        for (size_t i = static_cast<size_t>(depth); i < regs.size(); ++i) {
+            if (regs[i] != avoid) return regs[i];
+        }
+        for (const string& reg : regs) {
+            if (reg != avoid) return reg;
+        }
+        return "t0";
+    }
+
+    void emitExprInto(Expr& e, const string& dest, int depth) {
+        if (auto v = evalConst(e)) {
+            out << "    li " << dest << ", " << *v << "\n";
+            return;
+        }
+        switch (e.kind) {
+            case Expr::Number:
+                out << "    li " << dest << ", " << e.value << "\n";
+                break;
+            case Expr::Var:
+                emitLoadVarInto(e.name, dest);
+                break;
+            case Expr::Unary:
+                emitExprInto(*e.lhs, dest, depth + 1);
+                if (e.op == "-") out << "    neg " << dest << ", " << dest << "\n";
+                else if (e.op == "!") out << "    seqz " << dest << ", " << dest << "\n";
+                break;
+            case Expr::Binary:
+                emitBinaryInto(e, dest, depth);
+                break;
+            case Expr::Call:
+                if (optimize && emitInlineCall(e, dest)) break;
+                emitCall(e);
+                if (dest != "a0") out << "    mv " << dest << ", a0\n";
+                break;
+        }
+    }
+
+    void emitLoadVarInto(const string& name, const string& dest) {
+        if (!inlineSubsts.empty()) {
+            auto found = inlineSubsts.back().find(name);
+            if (found != inlineSubsts.back().end()) {
+                emitExprInto(*found->second, dest, 0);
+                return;
+            }
+        }
+        Symbol sym = lookup(name);
+        if (sym.isConst) {
+            out << "    li " << dest << ", " << sym.constValue << "\n";
+        } else if (sym.isGlobal) {
+            out << "    la t6, " << sym.label << "\n";
+            out << "    lw " << dest << ", 0(t6)\n";
+        } else if (!sym.reg.empty()) {
+            if (dest != sym.reg) out << "    mv " << dest << ", " << sym.reg << "\n";
+        } else {
+            out << "    lw " << dest << ", " << mem(sym.offset) << "\n";
+        }
+    }
+
+    bool emitInlineCall(Expr& call, const string& dest) {
+        auto found = funcMap.find(call.name);
+        if (found == funcMap.end() || found->second == currentFunc) return false;
+        Func* fn = found->second;
+        if (fn->returnsVoid || call.args.size() != fn->params.size()) return false;
+        for (auto& arg : call.args) {
+            if (hasCall(*arg)) return false;
+        }
+        if (fn->body->kind != Stmt::Block || fn->body->stmts.size() != 1) return false;
+        Stmt* ret = fn->body->stmts[0].get();
+        if (ret->kind != Stmt::Return || !ret->expr || hasCall(*ret->expr)) return false;
+
+        map<string, Expr*> subst;
+        for (size_t i = 0; i < fn->params.size(); ++i) {
+            subst[fn->params[i]] = call.args[i].get();
+        }
+        inlineSubsts.push_back(std::move(subst));
+        emitExprInto(*ret->expr, dest, 0);
+        inlineSubsts.pop_back();
+        return true;
+    }
+
+    void emitBinaryInto(Expr& e, const string& dest, int depth) {
+        if (e.op == "&&") {
+            string falseLabel = newLabel("land_false");
+            string endLabel = newLabel("land_end");
+            emitExprInto(*e.lhs, dest, depth + 1);
+            out << "    beqz " << dest << ", " << falseLabel << "\n";
+            emitExprInto(*e.rhs, dest, depth + 1);
+            out << "    snez " << dest << ", " << dest << "\n";
+            out << "    j " << endLabel << "\n";
+            out << falseLabel << ":\n";
+            out << "    li " << dest << ", 0\n";
+            out << endLabel << ":\n";
+            return;
+        }
+        if (e.op == "||") {
+            string trueLabel = newLabel("lor_true");
+            string endLabel = newLabel("lor_end");
+            emitExprInto(*e.lhs, dest, depth + 1);
+            out << "    bnez " << dest << ", " << trueLabel << "\n";
+            emitExprInto(*e.rhs, dest, depth + 1);
+            out << "    snez " << dest << ", " << dest << "\n";
+            out << "    j " << endLabel << "\n";
+            out << trueLabel << ":\n";
+            out << "    li " << dest << ", 1\n";
+            out << endLabel << ":\n";
+            return;
+        }
+        if (emitImmediateBinary(e, dest, depth)) return;
+        if (emitRegisterRhsBinary(e, dest, depth)) return;
+        string rhsReg = tempReg(depth, dest);
+        emitExprInto(*e.lhs, dest, depth + 1);
+        emitExprInto(*e.rhs, rhsReg, depth + 1);
+        if (e.op == "+") out << "    add " << dest << ", " << dest << ", " << rhsReg << "\n";
+        else if (e.op == "-") out << "    sub " << dest << ", " << dest << ", " << rhsReg << "\n";
+        else if (e.op == "*") out << "    mul " << dest << ", " << dest << ", " << rhsReg << "\n";
+        else if (e.op == "/") out << "    div " << dest << ", " << dest << ", " << rhsReg << "\n";
+        else if (e.op == "%") out << "    rem " << dest << ", " << dest << ", " << rhsReg << "\n";
+        else if (e.op == "<") out << "    slt " << dest << ", " << dest << ", " << rhsReg << "\n";
+        else if (e.op == ">") out << "    slt " << dest << ", " << rhsReg << ", " << dest << "\n";
+        else if (e.op == "<=") {
+            out << "    slt " << dest << ", " << rhsReg << ", " << dest << "\n";
+            out << "    xori " << dest << ", " << dest << ", 1\n";
+        } else if (e.op == ">=") {
+            out << "    slt " << dest << ", " << dest << ", " << rhsReg << "\n";
+            out << "    xori " << dest << ", " << dest << ", 1\n";
+        } else if (e.op == "==") {
+            out << "    xor " << dest << ", " << dest << ", " << rhsReg << "\n";
+            out << "    seqz " << dest << ", " << dest << "\n";
+        } else if (e.op == "!=") {
+            out << "    xor " << dest << ", " << dest << ", " << rhsReg << "\n";
+            out << "    snez " << dest << ", " << dest << "\n";
+        }
+    }
+
+    bool emitImmediateBinary(Expr& e, const string& dest, int depth) {
+        auto rhs = evalConst(*e.rhs);
+        auto lhs = evalConst(*e.lhs);
+        if (rhs) {
+            int32_t v = *rhs;
+            if (e.op == "+" && v == 0) {
+                emitExprInto(*e.lhs, dest, depth + 1);
+                return true;
+            }
+            if (e.op == "-" && v == 0) {
+                emitExprInto(*e.lhs, dest, depth + 1);
+                return true;
+            }
+            if (e.op == "*" && v == 0) {
+                out << "    li " << dest << ", 0\n";
+                return true;
+            }
+            if (e.op == "*" && v == 1) {
+                emitExprInto(*e.lhs, dest, depth + 1);
+                return true;
+            }
+            if (e.op == "+" && v >= -2048 && v <= 2047) {
+                emitExprInto(*e.lhs, dest, depth + 1);
+                out << "    addi " << dest << ", " << dest << ", " << v << "\n";
+                return true;
+            }
+            if (e.op == "-" && v >= -2047 && v <= 2048) {
+                emitExprInto(*e.lhs, dest, depth + 1);
+                out << "    addi " << dest << ", " << dest << ", " << -v << "\n";
+                return true;
+            }
+            if (e.op == "<" && v >= -2048 && v <= 2047) {
+                emitExprInto(*e.lhs, dest, depth + 1);
+                out << "    slti " << dest << ", " << dest << ", " << v << "\n";
+                return true;
+            }
+            if (e.op == ">=" && v >= -2048 && v <= 2047) {
+                emitExprInto(*e.lhs, dest, depth + 1);
+                out << "    slti " << dest << ", " << dest << ", " << v << "\n";
+                out << "    xori " << dest << ", " << dest << ", 1\n";
+                return true;
+            }
+            if (e.op == "==" && v == 0) {
+                emitExprInto(*e.lhs, dest, depth + 1);
+                out << "    seqz " << dest << ", " << dest << "\n";
+                return true;
+            }
+            if (e.op == "!=" && v == 0) {
+                emitExprInto(*e.lhs, dest, depth + 1);
+                out << "    snez " << dest << ", " << dest << "\n";
+                return true;
+            }
+            if (e.op == "*" && v > 0 && (v & (v - 1)) == 0) {
+                int shift = 0;
+                while (shift < 31 && (1u << shift) != static_cast<uint32_t>(v)) ++shift;
+                emitExprInto(*e.lhs, dest, depth + 1);
+                out << "    slli " << dest << ", " << dest << ", " << shift << "\n";
+                return true;
+            }
+        }
+        if (lhs) {
+            int32_t v = *lhs;
+            if (e.op == "+" && v == 0) {
+                emitExprInto(*e.rhs, dest, depth + 1);
+                return true;
+            }
+            if (e.op == "*" && v == 0) {
+                out << "    li " << dest << ", 0\n";
+                return true;
+            }
+            if (e.op == "*" && v == 1) {
+                emitExprInto(*e.rhs, dest, depth + 1);
+                return true;
+            }
+            if (e.op == "*" && v > 0 && (v & (v - 1)) == 0) {
+                int shift = 0;
+                while (shift < 31 && (1u << shift) != static_cast<uint32_t>(v)) ++shift;
+                emitExprInto(*e.rhs, dest, depth + 1);
+                out << "    slli " << dest << ", " << dest << ", " << shift << "\n";
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool emitRegisterRhsBinary(Expr& e, const string& dest, int depth) {
+        if (e.rhs->kind != Expr::Var) return false;
+        if (!inlineSubsts.empty() && inlineSubsts.back().count(e.rhs->name)) return false;
+        Symbol rhs = lookup(e.rhs->name);
+        if (rhs.reg.empty() || rhs.reg == dest) return false;
+        emitExprInto(*e.lhs, dest, depth + 1);
+        const string& r = rhs.reg;
+        if (e.op == "+") out << "    add " << dest << ", " << dest << ", " << r << "\n";
+        else if (e.op == "-") out << "    sub " << dest << ", " << dest << ", " << r << "\n";
+        else if (e.op == "*") out << "    mul " << dest << ", " << dest << ", " << r << "\n";
+        else if (e.op == "/") out << "    div " << dest << ", " << dest << ", " << r << "\n";
+        else if (e.op == "%") out << "    rem " << dest << ", " << dest << ", " << r << "\n";
+        else if (e.op == "<") out << "    slt " << dest << ", " << dest << ", " << r << "\n";
+        else if (e.op == ">") out << "    slt " << dest << ", " << r << ", " << dest << "\n";
+        else if (e.op == "<=") {
+            out << "    slt " << dest << ", " << r << ", " << dest << "\n";
+            out << "    xori " << dest << ", " << dest << ", 1\n";
+        } else if (e.op == ">=") {
+            out << "    slt " << dest << ", " << dest << ", " << r << "\n";
+            out << "    xori " << dest << ", " << dest << ", 1\n";
+        } else if (e.op == "==") {
+            out << "    xor " << dest << ", " << dest << ", " << r << "\n";
+            out << "    seqz " << dest << ", " << dest << "\n";
+        } else if (e.op == "!=") {
+            out << "    xor " << dest << ", " << dest << ", " << r << "\n";
+            out << "    snez " << dest << ", " << dest << "\n";
+        } else {
+            return false;
+        }
+        return true;
+    }
+
     void emitLoadVar(const string& name) {
+        if (!inlineSubsts.empty()) {
+            auto found = inlineSubsts.back().find(name);
+            if (found != inlineSubsts.back().end()) {
+                emitExpr(*found->second);
+                return;
+            }
+        }
         Symbol sym = lookup(name);
         if (sym.isConst) {
             out << "    li a0, " << sym.constValue << "\n";
         } else if (sym.isGlobal) {
             out << "    la t0, " << sym.label << "\n";
             out << "    lw a0, 0(t0)\n";
+        } else if (!sym.reg.empty()) {
+            out << "    mv a0, " << sym.reg << "\n";
         } else {
             out << "    lw a0, " << mem(sym.offset) << "\n";
         }
@@ -802,6 +1217,22 @@ private:
 
     void emitCall(Expr& e) {
         int n = static_cast<int>(e.args.size());
+        if (optimize && n <= 8) {
+            bool direct = true;
+            for (auto& arg : e.args) {
+                if (hasCall(*arg)) {
+                    direct = false;
+                    break;
+                }
+            }
+            if (direct) {
+                for (int i = 0; i < n; ++i) {
+                    emitExprInto(*e.args[i], "a" + to_string(i), 0);
+                }
+                out << "    call " << e.name << "\n";
+                return;
+            }
+        }
         for (auto& arg : e.args) {
             emitExpr(*arg);
             out << "    addi sp, sp, -4\n";
