@@ -478,14 +478,12 @@ public:
         prepareGlobalConsts();
         for (auto& fn : prog.funcs) {
             optimizeFunction(*fn);
-            set<string> live;
-            removeDeadStores(*fn->body, live);
         }
     }
 
 private:
     struct Known {
-        enum Kind { Const, Copy } kind = Const;
+        enum Kind { Const, Copy, Unknown } kind = Const;
         int32_t value = 0;
         string name;
     };
@@ -522,7 +520,8 @@ private:
                 env.back()[d->name] = k;
             }
         }
-        for (const string& p : fn.params) forgetName(p);
+        env.emplace_back();
+        for (const string& p : fn.params) markUnknown(p);
         optimizeStmt(fn.body);
     }
 
@@ -581,6 +580,8 @@ private:
                 k.kind = Known::Const;
                 k.value = *v;
                 env.back()[d.name] = k;
+            } else {
+                markUnknownInCurrentScope(d.name);
             }
             return;
         }
@@ -614,14 +615,14 @@ private:
     void optimizeWhile(unique_ptr<Stmt>& s) {
         set<string> assigned;
         collectAssigned(*s->thenStmt, assigned);
-        for (const string& name : assigned) forgetName(name);
+        for (const string& name : assigned) markUnknown(name);
         optimizeExpr(s->expr);
         if (auto cond = evalKnownConst(*s->expr); cond && *cond == 0) {
             s->kind = Stmt::Empty;
             return;
         }
         optimizeStmt(s->thenStmt);
-        for (const string& name : assigned) forgetName(name);
+        for (const string& name : assigned) markUnknown(name);
     }
 
     void optimizeExpr(unique_ptr<Expr>& e) {
@@ -633,7 +634,7 @@ private:
                 if (auto known = lookupKnown(e->name)) {
                     if (known->kind == Known::Const) {
                         e = makeNumber(known->value);
-                    } else {
+                    } else if (known->kind == Known::Copy) {
                         e = makeVar(known->name);
                     }
                 }
@@ -796,14 +797,19 @@ private:
     optional<Known> lookupKnown(const string& name) const {
         for (auto it = env.rbegin(); it != env.rend(); ++it) {
             auto found = it->find(name);
-            if (found != it->end()) return found->second;
+            if (found == it->end()) continue;
+            if (found->second.kind == Known::Unknown) return nullopt;
+            return found->second;
         }
         return nullopt;
     }
 
     void assignKnown(const string& name, const Expr& value) {
-        forgetName(name);
-        if (globalNames.count(name)) return;
+        forgetAliasesTo(name);
+        if (globalNames.count(name)) {
+            forgetLocalName(name);
+            return;
+        }
         assignKnownInCurrentScope(name, value);
     }
 
@@ -813,19 +819,28 @@ private:
             k.kind = Known::Const;
             k.value = *v;
             env.back()[name] = k;
-        } else if (value.kind == Expr::Var) {
-            Known k;
-            k.kind = Known::Copy;
-            k.name = value.name;
-            env.back()[name] = k;
         } else {
-            env.back().erase(name);
+            markUnknownInCurrentScope(name);
         }
     }
 
-    void forgetName(const string& name) {
-        for (auto& scope : env) scope.erase(name);
+    void markUnknown(const string& name) {
         forgetAliasesTo(name);
+        if (globalNames.count(name)) {
+            forgetLocalName(name);
+            return;
+        }
+        markUnknownInCurrentScope(name);
+    }
+
+    void markUnknownInCurrentScope(const string& name) {
+        Known k;
+        k.kind = Known::Unknown;
+        env.back()[name] = k;
+    }
+
+    void forgetLocalName(const string& name) {
+        for (size_t i = 1; i < env.size(); ++i) env[i].erase(name);
     }
 
     void forgetAliasesTo(const string& name) {
@@ -840,6 +855,7 @@ private:
     static bool sameKnown(const Known& a, const Known& b) {
         if (a.kind != b.kind) return false;
         if (a.kind == Known::Const) return a.value == b.value;
+        if (a.kind == Known::Unknown) return true;
         return a.name == b.name;
     }
 
