@@ -1520,30 +1520,6 @@ private:
         if (!currentFunc || e.kind != Expr::Call || e.name != currentFunc->name) return false;
         if (e.args.size() != currentFunc->params.size()) return false;
         int n = static_cast<int>(e.args.size());
-        if (optimize && n <= 8) {
-            bool direct = true;
-            for (auto& arg : e.args) {
-                if (hasCall(*arg) || exprDepth(*arg) > 6) {
-                    direct = false;
-                    break;
-                }
-            }
-            if (direct) {
-                for (int i = 0; i < n; ++i) {
-                    emitExprInto(*e.args[i], "a" + to_string(i), 0);
-                }
-                for (int i = 0; i < n; ++i) {
-                    Symbol sym = paramSymbol(*currentFunc, i);
-                    if (!sym.reg.empty()) {
-                        out << "    mv " << sym.reg << ", a" << i << "\n";
-                    } else {
-                        emitStoreReg("a" + to_string(i), sym.offset);
-                    }
-                }
-                out << "    j " << currentTailLabel << "\n";
-                return true;
-            }
-        }
         for (auto& arg : e.args) {
             emitExpr(*arg);
             out << "    addi sp, sp, -4\n";
