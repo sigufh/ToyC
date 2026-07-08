@@ -459,6 +459,7 @@ private:
     int labelId = 0;
     int slotCount = 0;
     int savedRegCount = 0;
+    int stackDepth = 0;
 
     string newLabel(const string& base) {
         return ".L" + base + "_" + to_string(labelId++);
@@ -466,6 +467,45 @@ private:
 
     static string mem(int offset, const string& base = "s0") {
         return to_string(offset) + "(" + base + ")";
+    }
+
+    static bool fitsImm12(int value) {
+        return value >= -2048 && value <= 2047;
+    }
+
+    void emitAddRegImm(const string& dst, const string& base, int value) {
+        if (fitsImm12(value)) {
+            out << "    addi " << dst << ", " << base << ", " << value << "\n";
+        } else {
+            out << "    li t6, " << value << "\n";
+            out << "    add " << dst << ", " << base << ", t6\n";
+        }
+    }
+
+    void emitAddSp(int value) {
+        emitAddRegImm("sp", "sp", value);
+    }
+
+    void emitStoreReg(const string& reg, int offset, const string& base = "s0") {
+        if (fitsImm12(offset)) {
+            out << "    sw " << reg << ", " << mem(offset, base) << "\n";
+            return;
+        }
+        string scratch = reg == "t6" ? "t5" : "t6";
+        out << "    li " << scratch << ", " << offset << "\n";
+        out << "    add " << scratch << ", " << base << ", " << scratch << "\n";
+        out << "    sw " << reg << ", 0(" << scratch << ")\n";
+    }
+
+    void emitLoadReg(const string& reg, int offset, const string& base = "s0") {
+        if (fitsImm12(offset)) {
+            out << "    lw " << reg << ", " << mem(offset, base) << "\n";
+            return;
+        }
+        string scratch = reg == "t6" ? "t5" : "t6";
+        out << "    li " << scratch << ", " << offset << "\n";
+        out << "    add " << scratch << ", " << base << ", " << scratch << "\n";
+        out << "    lw " << reg << ", 0(" << scratch << ")\n";
     }
 
     void prepareGlobals() {
@@ -571,6 +611,7 @@ private:
 
     void emitFunction(Func& fn) {
         currentFunc = &fn;
+        stackDepth = 0;
         scopes.clear();
         scopes.emplace_back();
         for (const string& p : fn.params) {
@@ -584,34 +625,34 @@ private:
         currentTailLabel = newLabel(fn.name + "_tail");
         out << "    .globl " << fn.name << "\n";
         out << fn.name << ":\n";
-        out << "    addi sp, sp, -" << fn.frameSize << "\n";
+        emitAddSp(-fn.frameSize);
         for (size_t i = 0; i < fn.savedRegs.size(); ++i) {
-            out << "    sw " << fn.savedRegs[i] << ", " << i * 4 << "(sp)\n";
+            emitStoreReg(fn.savedRegs[i], static_cast<int>(i) * 4, "sp");
         }
-        out << "    sw ra, " << fn.frameSize - 4 << "(sp)\n";
-        out << "    sw s0, " << fn.frameSize - 8 << "(sp)\n";
-        out << "    addi s0, sp, " << fn.frameSize << "\n";
+        emitStoreReg("ra", fn.frameSize - 4, "sp");
+        emitStoreReg("s0", fn.frameSize - 8, "sp");
+        emitAddRegImm("s0", "sp", fn.frameSize);
         for (size_t i = 0; i < fn.params.size(); ++i) {
             string dstReg = fn.paramRegs[fn.params[i]];
             if (i < 8) {
                 if (!dstReg.empty()) out << "    mv " << dstReg << ", a" << i << "\n";
-                else out << "    sw a" << i << ", " << mem(fn.paramOffsets[fn.params[i]]) << "\n";
+                else emitStoreReg("a" + to_string(i), fn.paramOffsets[fn.params[i]]);
             } else {
-                out << "    lw t0, " << (static_cast<int>(i) - 8) * 4 << "(s0)\n";
+                emitLoadReg("t0", (static_cast<int>(i) - 8) * 4);
                 if (!dstReg.empty()) out << "    mv " << dstReg << ", t0\n";
-                else out << "    sw t0, " << mem(fn.paramOffsets[fn.params[i]]) << "\n";
+                else emitStoreReg("t0", fn.paramOffsets[fn.params[i]]);
             }
         }
         out << currentTailLabel << ":\n";
         emitBlock(*fn.body);
         if (fn.returnsVoid) out << "    li a0, 0\n";
         out << currentEndLabel << ":\n";
-        out << "    lw ra, " << fn.frameSize - 4 << "(sp)\n";
-        out << "    lw s0, " << fn.frameSize - 8 << "(sp)\n";
+        emitLoadReg("ra", fn.frameSize - 4, "sp");
+        emitLoadReg("s0", fn.frameSize - 8, "sp");
         for (size_t i = 0; i < fn.savedRegs.size(); ++i) {
-            out << "    lw " << fn.savedRegs[i] << ", " << i * 4 << "(sp)\n";
+            emitLoadReg(fn.savedRegs[i], static_cast<int>(i) * 4, "sp");
         }
-        out << "    addi sp, sp, " << fn.frameSize << "\n";
+        emitAddSp(fn.frameSize);
         out << "    ret\n";
         currentFunc = nullptr;
     }
@@ -654,7 +695,7 @@ private:
                 break;
             case Stmt::Assign: {
                 Symbol sym = lookup(s.name);
-                if (optimize && !sym.reg.empty() && !hasCall(*s.rhs)) {
+                if (optimize && !sym.reg.empty() && !hasCall(*s.rhs) && exprDepth(*s.rhs) <= 6) {
                     emitExprInto(*s.rhs, sym.reg, 0);
                     break;
                 }
@@ -665,7 +706,7 @@ private:
                 } else if (!sym.reg.empty()) {
                     out << "    mv " << sym.reg << ", a0\n";
                 } else {
-                    out << "    sw a0, " << mem(sym.offset) << "\n";
+                    emitStoreReg("a0", sym.offset);
                 }
                 break;
             }
@@ -703,17 +744,21 @@ private:
             emitExpr(*arg);
             out << "    addi sp, sp, -4\n";
             out << "    sw a0, 0(sp)\n";
+            stackDepth += 4;
         }
         for (int i = 0; i < n; ++i) {
-            out << "    lw t0, " << (n - 1 - i) * 4 << "(sp)\n";
+            emitLoadReg("t0", (n - 1 - i) * 4, "sp");
             Symbol sym = lookup(currentFunc->params[i]);
             if (!sym.reg.empty()) {
                 out << "    mv " << sym.reg << ", t0\n";
             } else {
-                out << "    sw t0, " << mem(sym.offset) << "\n";
+                emitStoreReg("t0", sym.offset);
             }
         }
-        if (n > 0) out << "    addi sp, sp, " << n * 4 << "\n";
+        if (n > 0) {
+            emitAddSp(n * 4);
+            stackDepth -= n * 4;
+        }
         out << "    j " << currentTailLabel << "\n";
         return true;
     }
@@ -737,7 +782,7 @@ private:
             }
         }
         if (!d.reg.empty()) {
-            if (optimize && !hasCall(*d.init)) {
+            if (optimize && !hasCall(*d.init) && exprDepth(*d.init) <= 6) {
                 emitExprInto(*d.init, d.reg, 0);
             } else {
                 emitExpr(*d.init);
@@ -745,7 +790,7 @@ private:
             }
         } else {
             emitExpr(*d.init);
-            out << "    sw a0, " << mem(d.offset) << "\n";
+            emitStoreReg("a0", d.offset);
         }
         Symbol sym;
         sym.offset = d.offset;
@@ -799,7 +844,7 @@ private:
                 out << "    li a0, " << *v << "\n";
                 return;
             }
-            if (!hasCall(e)) {
+            if (!hasCall(e) && exprDepth(e) <= 6) {
                 emitExprInto(e, "a0", 0);
                 return;
             }
@@ -834,6 +879,16 @@ private:
         return false;
     }
 
+    int exprDepth(Expr& e) const {
+        int depth = 1;
+        if (e.lhs) depth = max(depth, 1 + exprDepth(*e.lhs));
+        if (e.rhs) depth = max(depth, 1 + exprDepth(*e.rhs));
+        for (const auto& arg : e.args) {
+            depth = max(depth, 1 + exprDepth(*arg));
+        }
+        return depth;
+    }
+
     string tempReg(int depth, const string& avoid) const {
         static const vector<string> regs = {"t0", "t1", "t2", "t3", "t4", "t5", "t6"};
         for (size_t i = static_cast<size_t>(depth); i < regs.size(); ++i) {
@@ -863,6 +918,11 @@ private:
                 else if (e.op == "!") out << "    seqz " << dest << ", " << dest << "\n";
                 break;
             case Expr::Binary:
+                if (exprDepth(e) > 6) {
+                    emitExpr(e);
+                    if (dest != "a0") out << "    mv " << dest << ", a0\n";
+                    break;
+                }
                 emitBinaryInto(e, dest, depth);
                 break;
             case Expr::Call:
@@ -890,7 +950,7 @@ private:
         } else if (!sym.reg.empty()) {
             if (dest != sym.reg) out << "    mv " << dest << ", " << sym.reg << "\n";
         } else {
-            out << "    lw " << dest << ", " << mem(sym.offset) << "\n";
+            emitLoadReg(dest, sym.offset);
         }
     }
 
@@ -905,6 +965,8 @@ private:
         if (fn->body->kind != Stmt::Block || fn->body->stmts.size() != 1) return false;
         Stmt* ret = fn->body->stmts[0].get();
         if (ret->kind != Stmt::Return || !ret->expr || hasCall(*ret->expr)) return false;
+        set<string> params(fn->params.begin(), fn->params.end());
+        if (!exprUsesOnlyNames(*ret->expr, params)) return false;
 
         map<string, Expr*> subst;
         for (size_t i = 0; i < fn->params.size(); ++i) {
@@ -913,6 +975,16 @@ private:
         inlineSubsts.push_back(std::move(subst));
         emitExprInto(*ret->expr, dest, 0);
         inlineSubsts.pop_back();
+        return true;
+    }
+
+    bool exprUsesOnlyNames(Expr& e, const set<string>& allowed) const {
+        if (e.kind == Expr::Var) return allowed.count(e.name) > 0;
+        if (e.lhs && !exprUsesOnlyNames(*e.lhs, allowed)) return false;
+        if (e.rhs && !exprUsesOnlyNames(*e.rhs, allowed)) return false;
+        for (const auto& arg : e.args) {
+            if (!exprUsesOnlyNames(*arg, allowed)) return false;
+        }
         return true;
     }
 
@@ -1058,7 +1130,9 @@ private:
     bool emitRegisterRhsBinary(Expr& e, const string& dest, int depth) {
         if (e.rhs->kind != Expr::Var) return false;
         if (!inlineSubsts.empty() && inlineSubsts.back().count(e.rhs->name)) return false;
-        Symbol rhs = lookup(e.rhs->name);
+        auto rhsOpt = tryLookup(e.rhs->name);
+        if (!rhsOpt) return false;
+        Symbol rhs = *rhsOpt;
         if (rhs.reg.empty() || rhs.reg == dest) return false;
         emitExprInto(*e.lhs, dest, depth + 1);
         const string& r = rhs.reg;
@@ -1087,6 +1161,16 @@ private:
         return true;
     }
 
+    optional<Symbol> tryLookup(const string& name) const {
+        for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
+            auto found = it->find(name);
+            if (found != it->end()) return found->second;
+        }
+        auto g = globals.find(name);
+        if (g != globals.end()) return g->second;
+        return nullopt;
+    }
+
     void emitLoadVar(const string& name) {
         if (!inlineSubsts.empty()) {
             auto found = inlineSubsts.back().find(name);
@@ -1104,7 +1188,7 @@ private:
         } else if (!sym.reg.empty()) {
             out << "    mv a0, " << sym.reg << "\n";
         } else {
-            out << "    lw a0, " << mem(sym.offset) << "\n";
+            emitLoadReg("a0", sym.offset);
         }
     }
 
@@ -1150,9 +1234,11 @@ private:
         emitExpr(*e.lhs);
         out << "    addi sp, sp, -4\n";
         out << "    sw a0, 0(sp)\n";
+        stackDepth += 4;
         emitExpr(*e.rhs);
         out << "    lw t0, 0(sp)\n";
         out << "    addi sp, sp, 4\n";
+        stackDepth -= 4;
         if (e.op == "+") out << "    add a0, t0, a0\n";
         else if (e.op == "-") out << "    sub a0, t0, a0\n";
         else if (e.op == "*") out << "    mul a0, t0, a0\n";
@@ -1229,7 +1315,16 @@ private:
                 for (int i = 0; i < n; ++i) {
                     emitExprInto(*e.args[i], "a" + to_string(i), 0);
                 }
+                int pad = (16 - (stackDepth % 16)) % 16;
+                if (pad > 0) {
+                    emitAddSp(-pad);
+                    stackDepth += pad;
+                }
                 out << "    call " << e.name << "\n";
+                if (pad > 0) {
+                    emitAddSp(pad);
+                    stackDepth -= pad;
+                }
                 return;
             }
         }
@@ -1237,25 +1332,35 @@ private:
             emitExpr(*arg);
             out << "    addi sp, sp, -4\n";
             out << "    sw a0, 0(sp)\n";
+            stackDepth += 4;
         }
         if (n > 0) out << "    mv t2, sp\n";
         int regArgs = min(n, 8);
         for (int i = 0; i < regArgs; ++i) {
             int off = (n - 1 - i) * 4;
-            out << "    lw a" << i << ", " << off << "(t2)\n";
+            emitLoadReg("a" + to_string(i), off, "t2");
         }
         int stackArgs = max(0, n - 8);
+        int pad = (16 - ((stackDepth + stackArgs * 4) % 16)) % 16;
+        if (pad > 0) {
+            emitAddSp(-pad);
+            stackDepth += pad;
+        }
         if (stackArgs > 0) {
             for (int j = n - 1; j >= 8; --j) {
                 int off = (n - 1 - j) * 4;
-                out << "    lw t0, " << off << "(t2)\n";
+                emitLoadReg("t0", off, "t2");
                 out << "    addi sp, sp, -4\n";
                 out << "    sw t0, 0(sp)\n";
+                stackDepth += 4;
             }
         }
         out << "    call " << e.name << "\n";
-        int bytesToPop = n * 4 + stackArgs * 4;
-        if (bytesToPop > 0) out << "    addi sp, sp, " << bytesToPop << "\n";
+        int bytesToPop = n * 4 + stackArgs * 4 + pad;
+        if (bytesToPop > 0) {
+            emitAddSp(bytesToPop);
+            stackDepth -= bytesToPop;
+        }
     }
 
     Symbol lookup(const string& name) const {
