@@ -118,6 +118,7 @@ struct Func {
     map<string, int> paramOffsets;
     map<string, string> paramRegs;
     vector<string> savedRegs;
+    bool usesFramePointer = true;
     int frameSize = 16;
 };
 
@@ -549,6 +550,7 @@ private:
             for (int i = 1; i <= savedRegCount; ++i) {
                 fn->savedRegs.push_back("s" + to_string(i));
             }
+            fn->usesFramePointer = slotCount > 0 || fn->params.size() > 8;
             fn->frameSize = alignTo(slotCount * 4 + 8 + static_cast<int>(fn->savedRegs.size()) * 4, 16);
         }
     }
@@ -623,15 +625,18 @@ private:
 
         currentEndLabel = newLabel(fn.name + "_end");
         currentTailLabel = newLabel(fn.name + "_tail");
+        bool saveRa = !optimize || stmtContainsCall(*fn.body);
         out << "    .globl " << fn.name << "\n";
         out << fn.name << ":\n";
         emitAddSp(-fn.frameSize);
         for (size_t i = 0; i < fn.savedRegs.size(); ++i) {
             emitStoreReg(fn.savedRegs[i], static_cast<int>(i) * 4, "sp");
         }
-        emitStoreReg("ra", fn.frameSize - 4, "sp");
-        emitStoreReg("s0", fn.frameSize - 8, "sp");
-        emitAddRegImm("s0", "sp", fn.frameSize);
+        if (saveRa) emitStoreReg("ra", fn.frameSize - 4, "sp");
+        if (fn.usesFramePointer) {
+            emitStoreReg("s0", fn.frameSize - 8, "sp");
+            emitAddRegImm("s0", "sp", fn.frameSize);
+        }
         for (size_t i = 0; i < fn.params.size(); ++i) {
             string dstReg = fn.paramRegs[fn.params[i]];
             if (i < 8) {
@@ -647,8 +652,8 @@ private:
         emitBlock(*fn.body);
         if (fn.returnsVoid) out << "    li a0, 0\n";
         out << currentEndLabel << ":\n";
-        emitLoadReg("ra", fn.frameSize - 4, "sp");
-        emitLoadReg("s0", fn.frameSize - 8, "sp");
+        if (saveRa) emitLoadReg("ra", fn.frameSize - 4, "sp");
+        if (fn.usesFramePointer) emitLoadReg("s0", fn.frameSize - 8, "sp");
         for (size_t i = 0; i < fn.savedRegs.size(); ++i) {
             emitLoadReg(fn.savedRegs[i], static_cast<int>(i) * 4, "sp");
         }
@@ -679,6 +684,18 @@ private:
         }
         if (s.kind == Stmt::If && s.elseStmt) {
             return stmtTerminates(*s.thenStmt) && stmtTerminates(*s.elseStmt);
+        }
+        return false;
+    }
+
+    bool stmtContainsCall(Stmt& s) const {
+        if (s.expr && hasCall(*s.expr)) return true;
+        if (s.rhs && hasCall(*s.rhs)) return true;
+        if (s.decl && s.decl->init && hasCall(*s.decl->init)) return true;
+        if (s.thenStmt && stmtContainsCall(*s.thenStmt)) return true;
+        if (s.elseStmt && stmtContainsCall(*s.elseStmt)) return true;
+        for (auto& child : s.stmts) {
+            if (stmtContainsCall(*child)) return true;
         }
         return false;
     }
@@ -811,8 +828,7 @@ private:
         }
         string elseLabel = newLabel("else");
         string endLabel = newLabel("ifend");
-        emitExpr(*s.expr);
-        out << "    beqz a0, " << elseLabel << "\n";
+        emitBranchIfFalse(*s.expr, elseLabel);
         emitStmt(*s.thenStmt);
         out << "    j " << endLabel << "\n";
         out << elseLabel << ":\n";
@@ -830,12 +846,64 @@ private:
         string end = newLabel("while_end");
         loopLabels.push_back({begin, end});
         out << begin << ":\n";
-        emitExpr(*s.expr);
-        out << "    beqz a0, " << end << "\n";
+        emitBranchIfFalse(*s.expr, end);
         emitStmt(*s.thenStmt);
         out << "    j " << begin << "\n";
         out << end << ":\n";
         loopLabels.pop_back();
+    }
+
+    void emitBranchIfFalse(Expr& e, const string& label) {
+        if (optimize && emitDirectBranchIfFalse(e, label)) return;
+        emitExpr(e);
+        out << "    beqz a0, " << label << "\n";
+    }
+
+    string emitBranchOperand(Expr& e, const string& scratch) {
+        if (e.kind == Expr::Var) {
+            Symbol sym = lookup(e.name);
+            if (sym.isConst) {
+                out << "    li " << scratch << ", " << sym.constValue << "\n";
+                return scratch;
+            }
+            if (!sym.reg.empty()) return sym.reg;
+        }
+        if (auto val = evalConst(e)) {
+            out << "    li " << scratch << ", " << *val << "\n";
+            return scratch;
+        }
+        emitExprInto(e, scratch, 0);
+        return scratch;
+    }
+
+    bool emitDirectBranchIfFalse(Expr& e, const string& label) {
+        if (hasCall(e) || exprDepth(e) > 6) return false;
+        if (e.kind == Expr::Unary && e.op == "!") {
+            emitExprInto(*e.lhs, "t0", 0);
+            out << "    bnez t0, " << label << "\n";
+            return true;
+        }
+        if (e.kind == Expr::Binary &&
+            (e.op == "<" || e.op == ">" || e.op == "<=" || e.op == ">=" ||
+             e.op == "==" || e.op == "!=")) {
+            string lhs = emitBranchOperand(*e.lhs, "t0");
+            string rhs = emitBranchOperand(*e.rhs, lhs == "t0" ? "t1" : "t0");
+            if (e.op == "<") out << "    bge " << lhs << ", " << rhs << ", " << label << "\n";
+            else if (e.op == ">") out << "    bge " << rhs << ", " << lhs << ", " << label << "\n";
+            else if (e.op == "<=") out << "    blt " << rhs << ", " << lhs << ", " << label << "\n";
+            else if (e.op == ">=") out << "    blt " << lhs << ", " << rhs << ", " << label << "\n";
+            else if (e.op == "==") out << "    bne " << lhs << ", " << rhs << ", " << label << "\n";
+            else if (e.op == "!=") out << "    beq " << lhs << ", " << rhs << ", " << label << "\n";
+            return true;
+        }
+        if (e.kind == Expr::Var) {
+            Symbol sym = lookup(e.name);
+            if (!sym.reg.empty()) {
+                out << "    beqz " << sym.reg << ", " << label << "\n";
+                return true;
+            }
+        }
+        return false;
     }
 
     void emitExpr(Expr& e) {
